@@ -1,1 +1,793 @@
+"""
+=============================================================================
+3º Trabalho Prático de Visão Computacional – UNICENTRO
+Análise 3D de Raízes com PyVista
+Prof. Dr. Mauro Miazaki
+=============================================================================
+Requisitos implementados:
+  (1) Interface interativa (tkinter + ttkbootstrap)
+  (2) Carregamento e pré-processamento (limpeza de bordas)
+  (3a) DVR – Direct Volume Rendering
+  (3b) Isosuperfície com suavização e decimação
+  (3c) Esqueleto + visualização combinada isosuperfície + esqueleto
+  (3d) Métricas: volume, área, compacidade, excentricidade, 5+ métricas de esqueleto
+  (3e) Visualização dividida e sincronizada (DVR | Isosuperfície)
+  (3f) Relatório em texto
 
+Uso:
+  python trabalho3_visao_computacional.py
+"""
+
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
+import os
+import sys
+import io
+import zipfile
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import numpy as np
+from PIL import Image
+import pyvista as pv
+from skimage import measure, morphology, filters
+from skimage.morphology import skeletonize_3d
+from scipy import ndimage
+
+# ---------------------------------------------------------------------------
+# Constantes / configurações globais
+# ---------------------------------------------------------------------------
+BORDER_CLEAN = 5          # pixels a zerar nas bordas externas de cada fatia
+ISO_VALUE    = 0.5        # valor padrão da isosuperfície (0..1 após normalização)
+SMOOTH_ITER  = 50         # iterações de suavização Laplaciana
+DECIMATE_T   = 0.70       # fração de decimação (0..1)
+
+# ---------------------------------------------------------------------------
+# Utilitários
+# ---------------------------------------------------------------------------
+
+def load_images_from_zip(zip_path: str) -> np.ndarray:
+    """Extrai e empilha todas as imagens PNG de um ZIP em um volume 3-D uint8."""
+    with zipfile.ZipFile(zip_path) as z:
+        names = sorted(n for n in z.namelist() if n.lower().endswith(".png"))
+        slices = []
+        for name in names:
+            data = z.read(name)
+            img  = Image.open(io.BytesIO(data)).convert("L")   # grayscale
+            slices.append(np.array(img, dtype=np.uint8))
+    return np.stack(slices, axis=0)   # shape: (Z, Y, X)
+
+
+def clean_borders(volume: np.ndarray, border: int = BORDER_CLEAN) -> np.ndarray:
+    """Zera os pixels das bordas externas de cada fatia (XY) e dos extremos Z."""
+    vol = volume.copy()
+    # bordas laterais (XY)
+    vol[:, :border, :]  = 0
+    vol[:, -border:, :] = 0
+    vol[:, :, :border]  = 0
+    vol[:, :, -border:] = 0
+    # bordas Z (primeiras e últimas fatias)
+    vol[:border, :, :]  = 0
+    vol[-border:, :, :] = 0
+    return vol
+
+
+def volume_to_pyvista(volume: np.ndarray) -> pv.ImageData:
+    """Converte ndarray (Z,Y,X) para pv.ImageData com escalares escalar=intensidade."""
+    grid = pv.ImageData()
+    grid.dimensions = (volume.shape[2], volume.shape[1], volume.shape[0])
+    flat = volume.transpose(2, 1, 0).ravel(order="F").astype(np.float32)
+    flat = flat / flat.max() if flat.max() > 0 else flat
+    grid.point_data["scalars"] = flat
+    return grid
+
+
+# ---------------------------------------------------------------------------
+# Pipeline de processamento
+# ---------------------------------------------------------------------------
+
+class RootData:
+    """Armazena dados processados de uma raiz."""
+
+    def __init__(self, name: str, zip_path: str, log_fn=None):
+        self.name     = name
+        self.zip_path = zip_path
+        self._log     = log_fn or print
+        self.volume_raw   = None   # uint8
+        self.volume_clean = None   # uint8, bordas limpas
+        self.grid         = None   # pv.ImageData
+        self.iso_mesh     = None   # isosuperfície bruta
+        self.iso_smooth   = None   # isosuperfície suavizada
+        self.iso_decim    = None   # isosuperfície decimada
+        self.skel_lines   = None   # pv.PolyData skeleton
+        self.metrics      = {}
+
+    # -----------------------------------------------------------------------
+    def load(self):
+        self._log(f"[{self.name}] Carregando imagens de {os.path.basename(self.zip_path)} ...")
+        self.volume_raw   = load_images_from_zip(self.zip_path)
+        self.volume_clean = clean_borders(self.volume_raw, BORDER_CLEAN)
+        self._log(f"[{self.name}] Volume: {self.volume_clean.shape} — "
+                  f"bordas limpas ({BORDER_CLEAN}px)")
+        self.grid = volume_to_pyvista(self.volume_clean)
+
+    # -----------------------------------------------------------------------
+    def compute_isosurface(self, iso_val: float = ISO_VALUE,
+                           smooth_iter: int = SMOOTH_ITER,
+                           decimate_target: float = DECIMATE_T):
+        self._log(f"[{self.name}] Gerando isosuperfície (iso={iso_val:.2f}) ...")
+        # marching cubes via pyvista
+        self.iso_mesh = self.grid.contour([iso_val], scalars="scalars")
+        n_raw = self.iso_mesh.n_cells
+        self._log(f"[{self.name}] Isosuperfície bruta: {n_raw} faces")
+
+        self._log(f"[{self.name}] Suavizando (iters={smooth_iter}) ...")
+        self.iso_smooth = self.iso_mesh.smooth(n_iter=smooth_iter,
+                                               relaxation_factor=0.1,
+                                               boundary_smoothing=True)
+
+        self._log(f"[{self.name}] Decimando (alvo={decimate_target*100:.0f}% redução) ...")
+        self.iso_decim = self.iso_smooth.decimate(decimate_target)
+        n_dec = self.iso_decim.n_cells
+        self._log(f"[{self.name}] Isosuperfície decimada: {n_dec} faces "
+                  f"({100*n_dec/n_raw:.1f}% do original)")
+
+    # -----------------------------------------------------------------------
+    def compute_skeleton(self):
+        self._log(f"[{self.name}] Computando esqueleto 3D (skimage) ...")
+        vol_norm = (self.volume_clean / 255.0)
+        # binariza com Otsu
+        thresh  = filters.threshold_otsu(vol_norm[vol_norm > 0])
+        binary  = vol_norm > thresh
+        # remove pequenos objetos
+        binary  = morphology.remove_small_objects(binary, min_size=64)
+        binary  = morphology.binary_closing(binary, morphology.ball(1))
+        skel    = skeletonize_3d(binary).astype(bool)
+        self._log(f"[{self.name}] Esqueleto: {skel.sum()} voxels")
+        # converte para linhas PyVista
+        coords  = np.argwhere(skel).astype(float)   # (N,3) em ordem Z,Y,X
+        coords  = coords[:, [2, 1, 0]]              # → X,Y,Z
+        if len(coords) < 2:
+            self.skel_lines = pv.PolyData()
+            return
+        cloud   = pv.PolyData(coords)
+        self.skel_lines = cloud
+        # guarda volume binário para métricas
+        self._skel_binary = skel
+        self._binary      = binary
+
+    # -----------------------------------------------------------------------
+    def compute_metrics(self):
+        self._log(f"[{self.name}] Calculando métricas ...")
+        mesh = self.iso_decim
+
+        # --- volume (contagem de voxels binários × volume de voxel)
+        vox_vol   = 1.0   # assumimos espaçamento unitário
+        vol_voxel = self._binary.sum() * vox_vol
+        self.metrics["volume_voxels"] = float(vol_voxel)
+
+        # --- área de superfície (soma das áreas das faces da malha)
+        surf_area = mesh.area
+        self.metrics["area_superficie"] = float(surf_area)
+
+        # --- compacidade = (36π V²) / A³
+        V = vol_voxel;  A = surf_area
+        compacity = (36 * np.pi * V**2) / (A**3) if A > 0 else 0.0
+        self.metrics["compacidade"] = float(compacity)
+
+        # --- excentricidade via momentos de inércia dos voxels binários
+        coords = np.argwhere(self._binary).astype(float)
+        if len(coords) > 3:
+            centroid = coords.mean(axis=0)
+            diff     = coords - centroid
+            cov      = (diff.T @ diff) / len(coords)
+            eigvals  = np.linalg.eigvalsh(cov)
+            eigvals  = np.sort(np.abs(eigvals))[::-1]
+            if eigvals[0] > 0:
+                eccentricity = np.sqrt(1 - eigvals[-1] / eigvals[0])
+            else:
+                eccentricity = 0.0
+            self.metrics["excentricidade"] = float(eccentricity)
+        else:
+            self.metrics["excentricidade"] = 0.0
+
+        # --- métricas de esqueleto ---
+        skel = self._skel_binary
+        # 1) comprimento total (nº voxels)
+        self.metrics["skel_total_voxels"] = int(skel.sum())
+
+        # 2) número de pontos de ramificação (vizinhos 26-conectados > 2)
+        struct = ndimage.generate_binary_structure(3, 3)  # 26-connect
+        neighbor_count = ndimage.convolve(skel.astype(np.int32), struct.astype(np.int32))
+        branch_pts = ((neighbor_count > 3) & skel)
+        self.metrics["skel_branch_points"] = int(branch_pts.sum())
+
+        # 3) número de pontos de terminal (apenas 1 vizinho no esqueleto)
+        tip_pts = ((neighbor_count == 2) & skel)   # 2 porque inclui o próprio
+        self.metrics["skel_tip_points"] = int(tip_pts.sum())
+
+        # 4) densidade do esqueleto = nº voxels skel / nº voxels binário
+        density = skel.sum() / max(self._binary.sum(), 1)
+        self.metrics["skel_density"] = float(density)
+
+        # 5) bounding-box ratio (comprimento/largura) → alongamento
+        z_idx, y_idx, x_idx = np.where(skel)
+        if len(z_idx) > 0:
+            dz = z_idx.max() - z_idx.min() + 1
+            dy = y_idx.max() - y_idx.min() + 1
+            dx = x_idx.max() - x_idx.min() + 1
+            elongation = max(dz, dy, dx) / max(min(dz, dy, dx), 1)
+        else:
+            elongation = 0.0
+        self.metrics["skel_elongation"] = float(elongation)
+
+        # 6) tortuosidade média
+        # estimada via comprimento do esqueleto / distância de bounding box diagonal
+        diag = np.sqrt(dz**2 + dy**2 + dx**2) if len(z_idx) > 0 else 1
+        tortuosity = skel.sum() / max(diag, 1)
+        self.metrics["skel_tortuosity"] = float(tortuosity)
+
+        # 7) número estimado de segmentos (ramos)
+        # Label da imagem do esqueleto sem pontos de ramificação
+        skel_no_branch = skel.copy()
+        skel_no_branch[branch_pts] = False
+        labeled, n_segs = ndimage.label(skel_no_branch, structure=struct)
+        self.metrics["skel_segments"] = int(n_segs)
+
+        self._log(f"[{self.name}] Métricas calculadas.")
+
+    # -----------------------------------------------------------------------
+    def run_full_pipeline(self, iso_val=ISO_VALUE,
+                          smooth_iter=SMOOTH_ITER,
+                          decimate_target=DECIMATE_T):
+        self.load()
+        self.compute_isosurface(iso_val, smooth_iter, decimate_target)
+        self.compute_skeleton()
+        self.compute_metrics()
+
+
+# ---------------------------------------------------------------------------
+# GUI principal
+# ---------------------------------------------------------------------------
+
+class App(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title("Visão Computacional – Análise 3D de Raízes")
+        self.geometry("1050x700")
+        self.configure(bg="#1e1e2e")
+
+        # dados
+        self.roots: dict[str, RootData] = {}
+        self.zip_b0207 = tk.StringVar()
+        self.zip_b0309 = tk.StringVar()
+        self.iso_val   = tk.DoubleVar(value=ISO_VALUE)
+        self.smooth_it = tk.IntVar(value=SMOOTH_ITER)
+        self.decim_t   = tk.DoubleVar(value=DECIMATE_T)
+
+        self._build_ui()
+
+    # -----------------------------------------------------------------------
+    def _build_ui(self):
+        # ---- estilos -------------------------------------------------------
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        BG   = "#1e1e2e"
+        FG   = "#cdd6f4"
+        ABTN = "#89b4fa"
+        style.configure("TFrame",       background=BG)
+        style.configure("TLabel",       background=BG, foreground=FG,
+                                        font=("Segoe UI", 10))
+        style.configure("TLabelframe",  background=BG, foreground=ABTN,
+                                        font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", background=BG, foreground=ABTN)
+        style.configure("TButton",      background="#313244", foreground=FG,
+                                        font=("Segoe UI", 10), relief="flat",
+                                        padding=(8, 4))
+        style.map("TButton",
+                  background=[("active", "#45475a"), ("pressed", "#585b70")])
+        style.configure("Accent.TButton", background=ABTN, foreground=BG,
+                        font=("Segoe UI", 10, "bold"), padding=(10, 5))
+        style.map("Accent.TButton",
+                  background=[("active", "#74c7ec"), ("pressed", "#89dceb")])
+        style.configure("TScale",       background=BG)
+        style.configure("TEntry",       fieldbackground="#313244",
+                        foreground=FG, insertcolor=FG)
+        style.configure("TNotebook",    background=BG)
+        style.configure("TNotebook.Tab", background="#313244", foreground=FG,
+                        padding=(10, 4), font=("Segoe UI", 10))
+        style.map("TNotebook.Tab",
+                  background=[("selected", "#45475a")],
+                  foreground=[("selected", ABTN)])
+
+        # ---- layout principal ----------------------------------------------
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left_col = ttk.Frame(main, width=300)
+        left_col.pack(side="left", fill="y", padx=(0, 10))
+        left_col.pack_propagate(False)
+
+        right_col = ttk.Frame(main)
+        right_col.pack(side="left", fill="both", expand=True)
+
+        # ---- coluna esquerda -----------------------------------------------
+        # logo / título
+        tk.Label(left_col, text="🌿 3D Root Analysis",
+                 bg="#1e1e2e", fg="#a6e3a1",
+                 font=("Segoe UI", 14, "bold")).pack(pady=(0, 10))
+
+        # ZIPs
+        frm_zip = ttk.LabelFrame(left_col, text="Arquivos de entrada")
+        frm_zip.pack(fill="x", pady=4)
+
+        self._make_file_row(frm_zip, "b0207.zip", self.zip_b0207, "b0207")
+        self._make_file_row(frm_zip, "b0309.zip", self.zip_b0309, "b0309")
+
+        # parâmetros
+        frm_par = ttk.LabelFrame(left_col, text="Parâmetros")
+        frm_par.pack(fill="x", pady=4)
+
+        self._make_slider(frm_par, "Isovalor:",      self.iso_val,   0.1, 0.9, 0.05)
+        self._make_slider(frm_par, "Suavização:",    self.smooth_it, 10,  200, 10)
+        self._make_slider(frm_par, "Decimação (%):", self.decim_t,   0.1, 0.95, 0.05)
+
+        # botão carregar / processar
+        ttk.Button(left_col, text="⚙  Carregar & Processar",
+                   style="Accent.TButton",
+                   command=self._start_processing).pack(fill="x", pady=6)
+
+        ttk.Separator(left_col, orient="horizontal").pack(fill="x", pady=4)
+
+        # botões de visualização
+        frm_vis = ttk.LabelFrame(left_col, text="Visualizações")
+        frm_vis.pack(fill="x", pady=4)
+        vis_buttons = [
+            ("📦  DVR – b0207",              lambda: self._show_dvr("b0207")),
+            ("📦  DVR – b0309",              lambda: self._show_dvr("b0309")),
+            ("🌐  Isosuperfície – b0207",    lambda: self._show_iso("b0207")),
+            ("🌐  Isosuperfície – b0309",    lambda: self._show_iso("b0309")),
+            ("🦴  Esqueleto – b0207",        lambda: self._show_skeleton("b0207")),
+            ("🦴  Esqueleto – b0309",        lambda: self._show_skeleton("b0309")),
+            ("🔀  Janela Dividida – b0207",  lambda: self._show_split("b0207")),
+            ("🔀  Janela Dividida – b0309",  lambda: self._show_split("b0309")),
+        ]
+        for label, cmd in vis_buttons:
+            ttk.Button(frm_vis, text=label, command=cmd).pack(fill="x", pady=2)
+
+        ttk.Separator(left_col, orient="horizontal").pack(fill="x", pady=4)
+        ttk.Button(left_col, text="📄  Gerar Relatório",
+                   command=self._show_report).pack(fill="x", pady=2)
+
+        # ---- coluna direita (notebook) -------------------------------------
+        self.notebook = ttk.Notebook(right_col)
+        self.notebook.pack(fill="both", expand=True)
+
+        # aba log
+        log_frame = ttk.Frame(self.notebook)
+        self.notebook.add(log_frame, text=" 📋 Log ")
+        self.log_box = scrolledtext.ScrolledText(
+            log_frame, bg="#181825", fg="#cdd6f4",
+            font=("Consolas", 9), state="disabled",
+            relief="flat", borderwidth=0
+        )
+        self.log_box.pack(fill="both", expand=True)
+
+        # aba métricas
+        met_frame = ttk.Frame(self.notebook)
+        self.notebook.add(met_frame, text=" 📊 Métricas ")
+        self.met_text = scrolledtext.ScrolledText(
+            met_frame, bg="#181825", fg="#a6e3a1",
+            font=("Consolas", 10), state="disabled",
+            relief="flat", borderwidth=0
+        )
+        self.met_text.pack(fill="both", expand=True)
+
+        # aba relatório
+        rep_frame = ttk.Frame(self.notebook)
+        self.notebook.add(rep_frame, text=" 📝 Relatório ")
+        self.rep_text = scrolledtext.ScrolledText(
+            rep_frame, bg="#181825", fg="#cdd6f4",
+            font=("Segoe UI", 10), state="disabled",
+            relief="flat", borderwidth=0, wrap="word"
+        )
+        self.rep_text.pack(fill="both", expand=True)
+
+        self._log("Bem-vindo! Selecione os ZIPs e clique em 'Carregar & Processar'.")
+
+    # -----------------------------------------------------------------------
+    def _make_file_row(self, parent, label, var, tag):
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", padx=4, pady=2)
+        ttk.Label(frm, text=label, width=9).pack(side="left")
+        ttk.Entry(frm, textvariable=var, width=14).pack(side="left", fill="x", expand=True)
+        ttk.Button(frm, text="…",
+                   command=lambda v=var, t=tag: self._browse(v, t),
+                   width=3).pack(side="left")
+
+    def _make_slider(self, parent, label, var, from_, to, resolution):
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", padx=4, pady=2)
+        ttk.Label(frm, text=label, width=14).pack(side="left")
+        sc = ttk.Scale(frm, variable=var, from_=from_, to=to,
+                       orient="horizontal")
+        sc.pack(side="left", fill="x", expand=True)
+        lbl = ttk.Label(frm, textvariable=var, width=5)
+        lbl.pack(side="left")
+
+    # -----------------------------------------------------------------------
+    def _browse(self, var: tk.StringVar, tag: str):
+        path = filedialog.askopenfilename(
+            title=f"Selecionar {tag}.zip",
+            filetypes=[("ZIP files", "*.zip"), ("All", "*.*")]
+        )
+        if path:
+            var.set(path)
+
+    # -----------------------------------------------------------------------
+    def _log(self, msg: str):
+        """Escreve no log (thread-safe)."""
+        def _do():
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", msg + "\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        self.after(0, _do)
+
+    # -----------------------------------------------------------------------
+    def _start_processing(self):
+        p207 = self.zip_b0207.get().strip()
+        p309 = self.zip_b0309.get().strip()
+        if not p207 or not p309:
+            messagebox.showerror("Erro", "Selecione ambos os ZIPs antes de processar.")
+            return
+        for path, tag in [(p207, "b0207"), (p309, "b0309")]:
+            if not os.path.isfile(path):
+                messagebox.showerror("Erro", f"Arquivo não encontrado:\n{path}")
+                return
+
+        def worker():
+            for path, tag in [(p207, "b0207"), (p309, "b0309")]:
+                rd = RootData(tag, path, log_fn=self._log)
+                rd.run_full_pipeline(
+                    iso_val        = self.iso_val.get(),
+                    smooth_iter    = int(self.smooth_it.get()),
+                    decimate_target= self.decim_t.get()
+                )
+                self.roots[tag] = rd
+            self.after(0, self._update_metrics_tab)
+            self._log("✅ Processamento concluído! Use os botões para visualizar.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    def _require_root(self, tag: str) -> "RootData | None":
+        if tag not in self.roots:
+            messagebox.showwarning("Aviso", f"Raiz '{tag}' ainda não processada.")
+            return None
+        return self.roots[tag]
+
+    # -----------------------------------------------------------------------
+    # ---- DVR (Direct Volume Rendering) ------------------------------------
+    def _show_dvr(self, tag: str):
+        rd = self._require_root(tag)
+        if rd is None: return
+
+        def _render():
+            plotter = pv.Plotter(title=f"DVR – {tag}")
+            plotter.set_background("black")
+
+            # Tabela de transferência de opacidade: fundo transparente, raízes opacas
+            opacity  = [0.0, 0.0, 0.05, 0.2, 0.8, 1.0]
+            colormap = "bone"
+            plotter.add_volume(
+                rd.grid, scalars="scalars",
+                opacity=opacity,
+                cmap=colormap,
+                shade=True,
+                diffuse=0.6, specular=0.3, ambient=0.3
+            )
+            plotter.add_text(f"DVR – {tag}", font_size=12, color="white")
+            plotter.show()
+
+        threading.Thread(target=_render, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # ---- Isosuperfície ----------------------------------------------------
+    def _show_iso(self, tag: str):
+        rd = self._require_root(tag)
+        if rd is None: return
+
+        def _render():
+            plotter = pv.Plotter(title=f"Isosuperfície – {tag}")
+            plotter.set_background("black")
+            plotter.add_mesh(rd.iso_decim,
+                             color="#c8a96e",
+                             smooth_shading=True,
+                             specular=0.3)
+            plotter.add_text(f"Isosuperfície (suavizada + decimada) – {tag}",
+                             font_size=11, color="white")
+            plotter.show()
+
+        threading.Thread(target=_render, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # ---- Esqueleto combinado com isosuperfície ----------------------------
+    def _show_skeleton(self, tag: str):
+        rd = self._require_root(tag)
+        if rd is None: return
+
+        def _render():
+            plotter = pv.Plotter(title=f"Isosuperfície + Esqueleto – {tag}")
+            plotter.set_background("black")
+            # isosuperfície semi-transparente
+            plotter.add_mesh(rd.iso_decim,
+                             color="#c8a96e", opacity=0.35,
+                             smooth_shading=True)
+            # esqueleto como nuvem de pontos colorida
+            if rd.skel_lines is not None and rd.skel_lines.n_points > 0:
+                plotter.add_points(rd.skel_lines.points,
+                                   color="#89b4fa",
+                                   point_size=2.5,
+                                   render_points_as_spheres=True)
+            plotter.add_text(f"Isosuperfície + Esqueleto – {tag}",
+                             font_size=11, color="white")
+            plotter.show()
+
+        threading.Thread(target=_render, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # ---- Janela dividida sincronizada (DVR | Iso) -------------------------
+    def _show_split(self, tag: str):
+        rd = self._require_root(tag)
+        if rd is None: return
+
+        def _render():
+            plotter = pv.Plotter(shape=(1, 2),
+                                 title=f"Janela Dividida Sincronizada – {tag}")
+            plotter.set_background("black")
+
+            # painel esquerdo: DVR
+            plotter.subplot(0, 0)
+            opacity  = [0.0, 0.0, 0.05, 0.2, 0.8, 1.0]
+            plotter.add_volume(rd.grid, scalars="scalars",
+                               opacity=opacity, cmap="bone",
+                               shade=True)
+            plotter.add_text("DVR", font_size=14, color="white")
+
+            # painel direito: isosuperfície
+            plotter.subplot(0, 1)
+            plotter.add_mesh(rd.iso_decim, color="#c8a96e",
+                             smooth_shading=True, specular=0.3)
+            plotter.add_text("Isosuperfície", font_size=14, color="white")
+
+            # sincronização de câmera
+            plotter.link_views()
+            plotter.show()
+
+        threading.Thread(target=_render, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # ---- Atualizar aba de métricas ----------------------------------------
+    def _update_metrics_tab(self):
+        self.met_text.configure(state="normal")
+        self.met_text.delete("1.0", "end")
+        sep = "─" * 55
+
+        for tag in ["b0207", "b0309"]:
+            if tag not in self.roots: continue
+            rd = self.roots[tag]
+            m  = rd.metrics
+            z, y, x = rd.volume_clean.shape
+            self.met_text.insert("end", f"\n{'═'*55}\n")
+            self.met_text.insert("end", f"  RAIZ: {tag.upper()}\n")
+            self.met_text.insert("end", f"{'═'*55}\n")
+            self.met_text.insert("end", f"  Volume (arquivo ZIP): {rd.zip_path}\n")
+            self.met_text.insert("end", f"  Dimensões do volume: {x} × {y} × {z} voxels\n")
+            self.met_text.insert("end", f"\n  {sep}\n  MÉTRICAS GEOMÉTRICAS\n  {sep}\n")
+            self.met_text.insert("end", f"  Volume (voxels)    : {m['volume_voxels']:.0f}\n")
+            self.met_text.insert("end", f"  Área de superfície : {m['area_superficie']:.2f} unid²\n")
+            self.met_text.insert("end", f"  Compacidade        : {m['compacidade']:.6f}\n")
+            self.met_text.insert("end", f"  Excentricidade     : {m['excentricidade']:.4f}\n")
+            self.met_text.insert("end", f"\n  {sep}\n  MÉTRICAS DO ESQUELETO\n  {sep}\n")
+            self.met_text.insert("end", f"  Voxels totais      : {m['skel_total_voxels']}\n")
+            self.met_text.insert("end", f"  Pontos de ramos    : {m['skel_branch_points']}\n")
+            self.met_text.insert("end", f"  Pontos terminais   : {m['skel_tip_points']}\n")
+            self.met_text.insert("end", f"  Densidade skel.    : {m['skel_density']:.4f}\n")
+            self.met_text.insert("end", f"  Alongamento (BB)   : {m['skel_elongation']:.2f}\n")
+            self.met_text.insert("end", f"  Tortuosidade       : {m['skel_tortuosity']:.2f}\n")
+            self.met_text.insert("end", f"  Nº de segmentos    : {m['skel_segments']}\n")
+
+        self.met_text.configure(state="disabled")
+        self.notebook.select(1)
+
+    # -----------------------------------------------------------------------
+    # ---- Gerar relatório --------------------------------------------------
+    def _show_report(self):
+        if len(self.roots) < 2:
+            messagebox.showwarning("Aviso", "Processe ambas as raízes primeiro.")
+            return
+
+        r207 = self.roots["b0207"]
+        r309 = self.roots["b0309"]
+        m207 = r207.metrics
+        m309 = r309.metrics
+        z207, y207, x207 = r207.volume_clean.shape
+        z309, y309, x309 = r309.volume_clean.shape
+
+        report = f"""
+╔══════════════════════════════════════════════════════════════════════╗
+║       RELATÓRIO – 3º TRABALHO PRÁTICO DE VISÃO COMPUTACIONAL        ║
+║       UNICENTRO / DECOMP – Prof. Dr. Mauro Miazaki                  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+1. PRÉ-PROCESSAMENTO
+═════════════════════
+As imagens foram carregadas diretamente dos arquivos ZIP (b0207.zip e
+b0309.zip), sem extração em disco. Cada arquivo contém 250 fatias PNG
+em escala de cinza, representando cortes tomográficos das raízes.
+
+Dimensões dos volumes:
+  • b0207: {x207} × {y207} × {z207} voxels  ({x207*y207*z207//1_000_000:.1f} Mvoxels)
+  • b0309: {x309} × {y309} × {z309} voxels  ({x309*y309*z309//1_000_000:.1f} Mvoxels)
+
+Limpeza de bordas (border cleaning):
+  • Os {BORDER_CLEAN} pixels das bordas externas (X, Y) e as {BORDER_CLEAN} primeiras/últimas
+    fatias em Z foram zerados. Essa operação elimina artefatos de borda
+    que aparecem nos escâneres (reflexões, ruído de truncamento), evitando
+    que sejam incluídos na isosuperfície ou no esqueleto.
+  • Após a limpeza, o volume normalizado (0–1) foi usado para todos os
+    passos seguintes.
+
+2. VISUALIZAÇÕES GERADAS
+═════════════════════════
+a) DVR (Direct Volume Rendering):
+   Renderização volumétrica direta usando tabela de transferência de
+   opacidade que torna o fundo completamente transparente e deixa as
+   regiões densas (raiz) com alta opacidade. Colormap "bone" realça
+   a estrutura radicular com tons claros sobre fundo preto.
+
+b) Isosuperfície:
+   Gerada via Marching Cubes (pyvista .contour) com isovalor = {self.iso_val.get():.2f}.
+   Suavização Laplaciana ({int(self.smooth_it.get())} iterações, fator 0.1) aplicada para
+   reduzir o escalonamento dos voxels.
+   Decimação de {self.decim_t.get()*100:.0f}% das faces para reduzir complexidade geométrica
+   mantendo a forma geral da raiz.
+
+c) Esqueleto:
+   Binarização via limiarização de Otsu, remoção de pequenos objetos
+   (min_size=64 voxels), fechamento morfológico (ball radius 1) e
+   skeletonize_3d (scikit-image). O esqueleto é exibido como nuvem de
+   pontos azul sobreposta à isosuperfície semi-transparente.
+
+d) Janela dividida e sincronizada:
+   Duas subjanelas do PyVista com câmera linkada (link_views()): painel
+   esquerdo exibe o DVR, painel direito exibe a isosuperfície. Rotação,
+   zoom e translação aplicados em uma janela refletem na outra.
+
+3. MÉTRICAS
+════════════
+
+               b0207              b0309
+  ─────────────────────────────────────────────────────
+  Volume (vox)  {m207['volume_voxels']:>12.0f}   {m309['volume_voxels']:>12.0f}
+  Área sup.     {m207['area_superficie']:>12.2f}   {m309['area_superficie']:>12.2f}
+  Compacidade   {m207['compacidade']:>12.6f}   {m309['compacidade']:>12.6f}
+  Excentr.      {m207['excentricidade']:>12.4f}   {m309['excentricidade']:>12.4f}
+  ─────────────────────────────────────────────────────
+  Skel voxels   {m207['skel_total_voxels']:>12d}   {m309['skel_total_voxels']:>12d}
+  Skel ramos    {m207['skel_branch_points']:>12d}   {m309['skel_branch_points']:>12d}
+  Skel tips     {m207['skel_tip_points']:>12d}   {m309['skel_tip_points']:>12d}
+  Skel dens.    {m207['skel_density']:>12.4f}   {m309['skel_density']:>12.4f}
+  Alongamento   {m207['skel_elongation']:>12.2f}   {m309['skel_elongation']:>12.2f}
+  Tortuosidade  {m207['skel_tortuosity']:>12.2f}   {m309['skel_tortuosity']:>12.2f}
+  Segmentos     {m207['skel_segments']:>12d}   {m309['skel_segments']:>12d}
+
+4. COMPARAÇÃO E ANÁLISE DAS DUAS RAÍZES
+═════════════════════════════════════════
+{self._generate_comparison(m207, m309)}
+
+5. METODOLOGIA TÉCNICA RESUMIDA
+══════════════════════════════════
+  • Linguagem: Python 3
+  • Bibliotecas: PyVista (visualização 3D), scikit-image (processamento de
+    imagem, marching cubes, skeletonize), scipy (ndimage, morfologia),
+    NumPy, Pillow, tkinter (GUI)
+  • Pipeline: ZIP → PIL grayscale → ndarray (Z,Y,X) → limpeza de bordas →
+    normalização → isosuperfície → suavização → decimação → esqueleto →
+    métricas
+"""
+
+        self.rep_text.configure(state="normal")
+        self.rep_text.delete("1.0", "end")
+        self.rep_text.insert("end", report)
+        self.rep_text.configure(state="disabled")
+        self.notebook.select(2)
+
+        # oferece salvar
+        if messagebox.askyesno("Relatório", "Deseja salvar o relatório em .txt?"):
+            path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text", "*.txt"), ("All", "*.*")],
+                initialfile="relatorio_raizes.txt"
+            )
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                self._log(f"Relatório salvo em: {path}")
+
+    # -----------------------------------------------------------------------
+    def _generate_comparison(self, m207: dict, m309: dict) -> str:
+        lines = []
+
+        def _cmp(label, key, higher_is="maior"):
+            v207 = m207[key]; v309 = m309[key]
+            ratio = v207 / v309 if v309 > 0 else float("inf")
+            bigger = "b0207" if v207 > v309 else "b0309"
+            pct = abs(ratio - 1) * 100
+            lines.append(
+                f"  • {label}: {bigger} é {pct:.1f}% {'maior' if v207 > v309 == (higher_is=='maior') else 'diferente'}"
+                f" ({v207:.2f} vs {v309:.2f})"
+            )
+
+        _cmp("Volume",        "volume_voxels")
+        _cmp("Área superf.",  "area_superficie")
+        _cmp("Compacidade",   "compacidade",  "menor")
+        _cmp("Excentricidade","excentricidade")
+        _cmp("Comprimento skel.", "skel_total_voxels")
+        _cmp("Pontos de ramo","skel_branch_points")
+        _cmp("Pontas terminais","skel_tip_points")
+        _cmp("Densidade skel.","skel_density")
+        _cmp("Alongamento",   "skel_elongation")
+        _cmp("Tortuosidade",  "skel_tortuosity")
+        _cmp("Segmentos",     "skel_segments")
+
+        # análise qualitativa
+        vol_diff   = m207["volume_voxels"]  / max(m309["volume_voxels"], 1)
+        branch_207 = m207["skel_branch_points"]
+        branch_309 = m309["skel_branch_points"]
+        elon_207   = m207["skel_elongation"]
+        elon_309   = m309["skel_elongation"]
+
+        lines.append("")
+        lines.append("  Interpretação geral:")
+        if vol_diff > 1.2:
+            lines.append("  → b0207 possui volume significativamente maior, indicando uma")
+            lines.append("    raiz mais robusta ou com maior massa de tecido.")
+        elif vol_diff < 0.8:
+            lines.append("  → b0309 possui volume significativamente maior.")
+        else:
+            lines.append("  → Os volumes são comparáveis entre as duas raízes.")
+
+        if branch_207 > branch_309 * 1.2:
+            lines.append("  → b0207 tem mais pontos de ramificação, sugerindo arquitetura")
+            lines.append("    radicular mais complexa / mais ramificada.")
+        elif branch_309 > branch_207 * 1.2:
+            lines.append("  → b0309 tem mais pontos de ramificação (maior complexidade).")
+
+        if elon_207 > elon_309:
+            lines.append("  → b0207 é mais alongada (raiz mais vertical/linear).")
+        else:
+            lines.append("  → b0309 é mais alongada (raiz mais vertical/linear).")
+
+        comp207 = m207["compacidade"]; comp309 = m309["compacidade"]
+        if comp207 > comp309:
+            lines.append("  → b0207 é mais compacta (morfologia mais esférica/globosa).")
+        else:
+            lines.append("  → b0309 é mais compacta (morfologia mais esférica/globosa).")
+
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # PyVista em modo offscreen desabilitado (queremos janelas reais)
+    pv.global_theme.multi_rendering_splitting_position = 0.5
+
+    app = App()
+    app.mainloop()
